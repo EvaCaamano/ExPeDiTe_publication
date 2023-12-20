@@ -1,0 +1,520 @@
+---
+title: "Analysis clinical and omics data from project Expedite"
+author: "Dr. Eva Caama&#241;o-Guti&#233;rrez"
+output:
+  html_document:
+    df_print: paged
+---
+
+This is a document to showcase the analysis done for the project Expedite. It was undertaken by the Computational Biology Facility (https://www.liverpool.ac.uk/computational-biology-facility/) at the University of Liverpool. The data has been provided by Dr Christopher Hill, a post-doctoral researcher based at the Liverpool Women's Hospital and consists of metadata (anonymised patient information), levels of progesterone and HCG and normalised batch corrected NMR metabolomics data (the later consisting of peak abundances - some of those peaks are associated to a known metabolite but multiple are still unidentified). 
+
+As a first step we load required functions.
+
+```{r,warning=F,message=F,tidy=T}
+
+source("ExpediteFunctions.R")
+
+```
+
+We load the data and do some prelim visualizations and checks. 
+```{r,warning=F,message=F,tidy=T}
+
+exp_Combat<-read_excel("EXPEDITE_Data_Aug23.xlsx",sheet=2)
+
+#note that the data above contain metadata and data. Metadata is in the first 9 columns
+#note that after exploration both HCG and Progesterone do not seem to be log2 so they will be transformed
+
+exp_Combat$HCG<-log2(exp_Combat$HCG)
+exp_Combat$Progesterone<-log2(exp_Combat$Progesterone)
+
+#visualisations with PCA to appraise possible structure. The batch correction proved effective but no links to other structure can be made
+do_PCA_Plot_Nov16(exp_Combat[,c(4,5,10:ncol(exp_Combat))],exp_Combat$Group,scale = F,legendName = "",colores=c("olivedrab","orange","steelblue","darkgrey"))
+do_PCA_Plot_Nov16(exp_Combat[,c(4,5,10:ncol(exp_Combat))],exp_Combat$Batch,scale = F,legendName = "")
+
+#assessing missingness
+apply(exp_Combat,2,function(x) sum(is.na(x)))[apply(exp_Combat,2,function(x) sum(is.na(x)))!=0]
+```
+
+We have identified that there are four variables with missing values. HCG, Progesterone, Gestation at consent and BMI.For this first analysis we will not include patients with missing value (losing 14 total).  For the time being we excluded these patients from the study although in the future we could try imputation.
+
+We will build univariate models to determine which variables are important to explain differences between groups. To select the best models to build and which covariates to include, we will do an assessment of variance.
+
+We aim to try to find markers between all the different diagnosis but this may not be possible so we will also test whether we can find markers between normal and other diagnosis. For this we would need a dummy group
+
+```{r,warning=F,message=F,tidy=T}
+bimodalGroup<-exp_Combat$Group
+bimodalGroup[!bimodalGroup%in%c("LNSP")]<-"Other"
+bimodalGroup<-factor(bimodalGroup,ordered=T, levels=c("LNSP","Other"))
+
+```
+
+
+As our aim is to try to find a composite biomarker using a machine learning approach, to follow best practices and avoid data leakage we will be undertaken the Univariate Statistics on the data split that will serve for variable selection leaving an untouched part of data for validation
+
+
+## Univariate analysis - using batch corrected data
+
+#### Create dataset
+```{r,warning=F,message=F,tidy=T}
+#create dataset with the key variables for modelling, HCG and progesterone plus the metabolomics
+#we take complete observations for this as this is a first pass for the analysis. Inputation may be consider at a later point.
+
+#Analysis using the data that has gone through Combat
+set.seed(800)
+data_for_limma<-data.frame("Group"=exp_Combat$Group,"BiGroup"=bimodalGroup,
+                           "BMI"=exp_Combat$BMI,
+                           "Smoker"=exp_Combat$`Smoker (Y/N)`,
+                           "Gestation"=exp_Combat$`Gestation at consent (weeks)`,
+                           "Age"=exp_Combat$`Age (years)`,
+                           exp_Combat[,c(4,5,10:ncol(exp_Combat))])
+
+data_for_limma<-data_for_limma[complete.cases(data_for_limma),]
+data_for_limma$Group<-factor(data_for_limma$Group,levels=c("LNSP","Miscarriage","tEP","PUL"))
+numeric_data<-data_for_limma[,7:ncol(data_for_limma)]
+```
+
+#### Analysis of variance to determine covariates
+```{r varPartition, warning=F,message=F,tidy=T,out.width="100%"}
+
+form <- ~(1|Group)+BMI+(1|Smoker)+Gestation+Age
+#note as per package recommendation, all categorical variables are modeled as random effects with continuous as fixed effects
+
+varPart <- fitExtractVarPartModel(t(numeric_data), form, data_for_limma[,1:6])
+
+vp <- sortCols(varPart,last="Residuals")
+vp_bars <- plotPercentBars(vp[1:30, ])+theme(legend.position="bottom")#top 30 so we can see some detail
+vp_violin <- plotVarPart(vp) 
+
+ggarrange(vp_bars, vp_violin, 
+          labels = c("A", "B"),
+          ncol = 2, nrow = 1)
+
+```
+
+While unfortunately the majority of the variance is not explained by one of the factors captured we can see that Age, BMI and Group are the most important factors, followed by Gestation. The smoking status does not seem to have a relevant weight and as such we will not include it in the models. 
+
+
+#### Preparation of data for the statistics
+This step will be undertaken using data from metabolites + HCG +Progesterone
+```{r,warning=F,message=F,tidy=T}
+#creating the firs split to keep some data for further validation ----
+set.seed(800)
+#first for multigroup
+dataSplit_forValidation<-applyPrepData(data_train = numeric_data,prepData = prepData,factor_var = data_for_limma$Group,split = 0.8,n = 1)
+#indeces
+tr_idx_mg<-dataSplit_forValidation[[1]]$idx
+
+#then for 2 group
+dataSplit_forValidation_2group<-applyPrepData(data_train = numeric_data,prepData = prepData,factor_var = data_for_limma$BiGroup,split = 0.8,n = 1)
+tr_idx_2g<-dataSplit_forValidation_2group[[1]]$idx
+
+#these lists will be used in the multivariate part but for the univariate part we only need the indices in the tr_idx variables
+```
+
+
+```{r,warning=F,message=F,tidy=T}
+design_MultGroups<-model.matrix(~0+Group+BMI+Gestation+Age,data=data_for_limma[tr_idx_mg,])
+design_2groups<-model.matrix(~0+BiGroup+BMI+Gestation+Age,data=data_for_limma[tr_idx_2g,])
+
+colnames(design_MultGroups)<-c("LNSP","Miscarriage","tEP","PUL","BMI","Gestation","Age")
+colnames(design_2groups)<-c("LNSP","Other","BMI","Gestation","Age")
+
+fit_MultGroups<-lmFit(t(numeric_data[tr_idx_mg,]), design_MultGroups)
+fit_2groups<-lmFit(t(numeric_data[tr_idx_2g,]), design_2groups)
+
+
+# Contrasts for the multigroup comparison ----
+contrasts_MultGroups <- makeContrasts(Miscarriage - LNSP,
+                           tEP - LNSP,
+                           PUL - LNSP,
+                           Miscarriage - tEP,
+                           levels = design_MultGroups)
+
+contrast_fit_MultGroups <- contrasts.fit(fit_MultGroups, contrasts_MultGroups)
+contrast_ebayes_MultGroups <- eBayes(contrast_fit_MultGroups)
+
+
+results_Miscarriage_LNSP <- data.frame(topTable(contrast_ebayes_MultGroups, coef = 1, adjust = "fdr",number = ncol(exp_Combat),p.value = 0.05))
+results_tEP_LNSP <- data.frame(topTable(contrast_ebayes_MultGroups, coef = 2, adjust = "fdr",number = ncol(exp_Combat),p.value = 0.05))
+results_PUL_LNSP <- data.frame(topTable(contrast_ebayes_MultGroups, coef = 3, adjust = "fdr",number = ncol(exp_Combat),p.value = 0.05))
+results_Miscarriage_tEP <- data.frame(topTable(contrast_ebayes_MultGroups, coef = 4, adjust = "fdr",number = ncol(exp_Combat),p.value = 0.05))#this results in none so we do not include it later
+
+
+results_Miscarriage_LNSP$Metabolite<-rownames(results_Miscarriage_LNSP)
+results_Miscarriage_LNSP$Comparison<-"Miscarriage_LNSP"
+results_tEP_LNSP$Metabolite<-rownames(results_tEP_LNSP)
+results_tEP_LNSP$Comparison<-"tEP_LNSP"
+results_PUL_LNSP$Metabolite<-rownames(results_PUL_LNSP)
+results_PUL_LNSP$Comparison<-"PUL_LNSP"
+#results_Miscarriage_tEP$Metabolite<-rownames(results_Miscarriage_tEP)
+#results_Miscarriage_tEP$Comparison<-"Miscarriage_tEP"
+
+results<-rbind(results_Miscarriage_LNSP,results_tEP_LNSP,results_PUL_LNSP)#,results_Miscarriage_tEP)
+
+results
+write.csv(results, "UnivarResults_CombatData_MultiGroupComparison.csv")
+
+
+unique(results$Metabolite)
+s<-length(unique(results$Metabolite))
+
+
+# contrasts for the 2-group comparison ----
+
+# Contrasts for the multigroup comparison ----
+contrasts_2groups <- makeContrasts(Other - LNSP,
+                                      levels = design_2groups)
+
+contrast_fit_2groups <- contrasts.fit(fit_2groups, contrasts_2groups)
+contrast_ebayes_2groups <- eBayes(contrast_fit_2groups)
+
+#if I run the eBayes without the contrasts bit I will get info on the effect of the confounders.
+#density plots of the different confounders
+
+results_Other_LNSP <- data.frame(topTable(contrast_ebayes_2groups, coef = 1, adjust = "fdr", number = ncol(exp_Combat),p.value = 0.05))
+
+nrow(results_Other_LNSP)#number of significant metabolites
+
+results_Other_LNSP$Metabolite<-rownames(results_Other_LNSP)
+results_Other_LNSP$Comparison<-"Other_LNSP"
+
+results_Other_LNSP
+write.csv(results_Other_LNSP, "UnivarResults_CombatData_2GroupComparison.csv")
+
+
+unique(results_Other_LNSP$Metabolite)
+s2<-length(unique(results_Other_LNSP$Metabolite))
+
+
+```
+
+In total we have found `r s` potential candidates as biomarkers for the multigroup comparisons and `r s2` for the 2 group comparison. Below are two PCAs to see if the structure of the data has improved but we cannot really say it has.
+
+
+```{r,warning=F,message=F,tidy=T}
+#multigroup comparison
+do_PCA_Plot_Nov16(exp_Combat[,unique(results$Metabolite)],exp_Combat$Group,scale = F,legendName = "")
+do_PCA_Plot_Nov16(exp_Combat[,unique(results_Other_LNSP$Metabolite)],bimodalGroup,scale = F,legendName = "")
+#two group comparison
+
+```
+
+
+
+
+## Multivariate analysis
+
+Now using those variables we want to see if we can find a suitable composite biomarker. We will bring the significant signals forward to do further selection. 
+
+We will apply an 10-fold cross-validation system to select variables. We will do so by splitting the data in different slices and finding consensus variables. The variable selection will be undertaken using Lasso selection. We will undertake this process for multigroup and 2-group comparisons. 
+
+
+### Overlap of signals found with both approaches
+```{r}
+
+univarRes<-list("Comp_Multi"=unique(results$Metabolite),
+                "Comp_2group"=unique(results_Other_LNSP$Metabolite))
+
+venn.diagram(univarRes,filename = "VennDiagramUnivarResults.png")
+display_venn <- function(x, ...){
+  library(VennDiagram)
+  grid.newpage()
+  venn_object <- venn.diagram(x, filename = NULL, ...)
+  grid.draw(venn_object)
+}
+
+display_venn(univarRes,fill=c("cadetblue2","salmon3"))
+
+```
+
+
+In the Venn diagram above we can see the overlap of the significant variables for each dataset and model. Below, the identities for those signals are shown. For this step we will leave HCG and Progesterone out and we will focus on refining tthe list of metabolites to include in the model.
+
+```{r,warning=F,message=F,tidy=T}
+
+univarResDF<-rbind(data.frame("Metab"=unique(results$Metabolite),"Comp"="Combat_Multi"),
+                   data.frame("Metab"=unique(results_Other_LNSP$Metabolite),"Comp"="Combat_2group"))
+                
+
+table(univarResDF$Metab,univarResDF$Comp)
+
+tableUnivarRes<-as.matrix(table(univarResDF$Metab,univarResDF$Comp))
+tableUnivarRes_sum<-data.frame("Metab"=rownames(tableUnivarRes),"Count"=rowSums(tableUnivarRes))
+tableUnivarRes_sum[order(tableUnivarRes_sum[,2],decreasing = T),]
+
+
+univarResDF_noHCG_Prog<-univarResDF[!univarResDF$Metab%in%c("HCG","Progesterone"),]
+
+```
+
+In the steps above, the 10-fold cross validation is applied to select variables. Note that each fold will undergo a selection on 100 models, and only if selected in at least 80% of the models the variable is considered as a candidate stable marker. 
+
+```{r, echo=F, eval=F,warning=F,message=F,tidy=T}
+#creating the firs split to keep some data for further validation ----
+
+#first for multigroup
+dataSplit_forValidation<-applyPrepData(data_train = numeric_data[,colnames(numeric_data)%in%univarResDF$Metab],prepData = prepData,factor_var = data_for_limma$Group,split = 0.8,n = 1)
+#then for 2 group
+dataSplit_forValidation_2group<-applyPrepData(data_train = numeric_data[,colnames(numeric_data)%in%univarResDF$Metab],prepData = prepData,factor_var = data_for_limma$BiGroup,split = 0.8,n = 1)
+
+```
+
+We will undertake this process without HCG and progesterone with the aim of selecting the most predictive metabolites and assess their predictive power overall
+
+```{r,warning=F,message=F,tidy=T}
+#creating data splits for N-Fold cross validation ----
+#for multigroup
+dataSplits<-applyPrepData(data_train = dataSplit_forValidation[[1]]$train[,colnames(dataSplit_forValidation[[1]]$train)%in%univarResDF_noHCG_Prog[univarResDF_noHCG_Prog$Comp=="Combat_Multi","Metab"]],prepData = prepData,factor_var = dataSplit_forValidation[[1]]$factor_train,split = 0.9,n = 10)
+
+#for 2 groups
+dataSplits_2groups<-applyPrepData(data_train = dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%univarResDF_noHCG_Prog[univarResDF_noHCG_Prog$Comp=="Combat_2group","Metab"]],prepData = prepData,factor_var = dataSplit_forValidation_2group[[1]]$factor_train,split = 0.9,n = 10)
+
+#applying the Variable selection in the 10 data splits created with Lasso----
+#for multigroup
+exp_LassoRes_multiGroup<-applyMultiVarSelectionForCrossVal_withModel(inputListwSplits = dataSplits,functionSelection = multimodalLasso,thresMod = 80,ntree = 500 )
+
+#for 2groups
+exp_LassoRes_2groups<-applyMultiVarSelectionForCrossVal_withModel(inputListwSplits = dataSplits_2groups,functionSelection = TwoClassLasso,thresMod = 80,ntree = 500 )
+
+
+```
+#### Metabolite signals that pass the 80% cut off in the different data slices
+
+Note that below we are presenting each metabolite signal and the number of times that it passed the 80% threshold accross the 10 data folds. Then we use the most consistent signals to visualise potential structure using PCA.
+
+
+```{r,warning=F,message=F,tidy=T}
+#Check the frequency certain variables are selected on the different datasets, the aim is to select those that are selected in a high number of data slices
+
+exp_LassoRes_concRes_multiGroup<-as.data.frame(table(concatenateVarSelec(exp_LassoRes_multiGroup)))
+exp_LassoRes_concRes_multiGroup
+
+
+exp_LassoRes_concRes_2groups<-as.data.frame(table(concatenateVarSelec(exp_LassoRes_2groups)))
+exp_LassoRes_concRes_2groups
+
+
+
+
+#Visualising structure using all the dataset with variables that appear in at least 8 data slices plus some key others such as BMI, gestation and the levels of progesterone and HCG. While no clear structure is seen in the PCA, we can see that the group with the worse prognosis (Other) presents some differences accoss PC1 with respect to LNSP
+
+#PCA using only selected metabolite signals for multiple groups
+do_PCA_Plot_Nov16(numeric_data[,as.character(exp_LassoRes_concRes_multiGroup[exp_LassoRes_concRes_multiGroup$Freq>8,1])],data_for_limma$Group,legendName = "",colores=c("olivedrab","orange","steelblue","darkgrey"))
+
+#PCA using selected metabolite signals+BMI+Gestation+AgeProgesterone+HCG for multiple groups
+do_PCA_Plot_Nov16(data.frame(numeric_data[,as.character(exp_LassoRes_concRes_multiGroup[exp_LassoRes_concRes_multiGroup$Freq>8,1])],data_for_limma$BMI,data_for_limma$Gestation,data_for_limma$Age,data_for_limma$Progesterone,data_for_limma$HCG),data_for_limma$Group,legendName = "", colores=c("olivedrab","orange","steelblue","darkgrey"))
+
+#PCA using only selected metabolite signals for 2group
+BiGroupCAO<-factor(gsub("Other","CAO",data_for_limma$BiGroup),ordered = T,levels=c("LNSP","CAO"))
+do_PCA_Plot_Nov16(data = numeric_data[,as.character(exp_LassoRes_concRes_2groups[exp_LassoRes_concRes_2groups$Freq>6,1])],groups = BiGroupCAO,legendName = "",colores = c("green4","darkmagenta"))
+
+#PCA using selected metabolite signals+BMI+Gestation+Age+Progesterone+HCG for 2group comparison
+
+do_PCA_Plot_Nov16(data.frame(numeric_data[,as.character(exp_LassoRes_concRes_2groups[exp_LassoRes_concRes_2groups$Freq>6,1])],data_for_limma$BMI,data_for_limma$Gestation,data_for_limma$Age,data_for_limma$Progesterone,data_for_limma$HCG),BiGroupCAO,legendName = "",colores = c("green4","darkmagenta"))
+
+#PCA using selected metabolite signals+BMI+Gestation+Age+Progesterone+HCG for 2group comparison - further metabolite selection (8 slices)
+
+do_PCA_Plot_Nov16(data.frame(numeric_data[,as.character(exp_LassoRes_concRes_2groups[exp_LassoRes_concRes_2groups$Freq>8,1])],data_for_limma$BMI,data_for_limma$Gestation,data_for_limma$Age,data_for_limma$Progesterone,data_for_limma$HCG),BiGroupCAO,legendName = "",colores = c("green4","darkmagenta"))
+
+```
+
+#### Assessing the performance of each fold with its selected variables
+```{r,warning=F,message=F,tidy=T}
+
+# Assessing performance for different selection ----
+
+
+#for multigroup
+exp_LassoRes_multiGroup_modelMetExtract<-modelMetrExtract(exp_LassoRes_multiGroup)
+write.csv(exp_LassoRes_multiGroup_modelMetExtract,"ModelMetrics_DifferentVariables_10Slices_Multigroup.csv")
+#for 2group
+exp_LassoRes_2groups_modelMetExtract<-modelMetrExtract(exp_LassoRes_2groups)
+write.csv(exp_LassoRes_2groups_modelMetExtract,"ModelMetrics_DifferentVariables_10Slices_2groups.csv")
+
+print(exp_LassoRes_multiGroup_modelMetExtract[,c(1,2,3,4,7,8,9,13)],row.names=F)
+print(exp_LassoRes_2groups_modelMetExtract[,c(1,2,3,6,7,8,12)])
+
+```
+
+Above we could see that the models generated are not excellent. Quite variable with best performances predicting with circa 70% balance accuracy. However these models are using solely the metabolite fingerprint to predict.
+
+### Performance of selected signals - on Train data used for variable selection
+
+
+```{r,warning=F,message=F,tidy=T}
+#  Models on the train/test splits ----
+#selecting signals that have been selected in at least 7 data slices
+
+final_varsSelected_multigroup<-as.character(exp_LassoRes_concRes_multiGroup[exp_LassoRes_concRes_multiGroup$Freq>6,1])
+final_varsSelected_multigroup
+final_varsSelected_2groups<-as.character(exp_LassoRes_concRes_2groups[exp_LassoRes_concRes_2groups$Freq>6,1])
+final_varsSelected_2groups  
+
+
+Predict_TrainDataSplits_multiGroup<-applyModelsToDataSplits(inputListwSplits = dataSplits,varsForModel = final_varsSelected_multigroup,ntree = 500)
+write.csv(modelMetrExtract(Predict_TrainDataSplits_multiGroup),"Predict_TrainDataSplits_multigroup.csv")
+
+Predict_TrainDataSplits_2groups<-applyModelsToDataSplits(inputListwSplits = dataSplits_2groups,varsForModel = final_varsSelected_2groups,ntree = 500)
+write.csv(modelMetrExtract(Predict_TrainDataSplits_2groups),"Predict_TrainDataSplits_2groups.csv")
+
+
+```
+### Performance of selected signals - on validation data
+
+```{r,warning=F,message=F,tidy=T}
+# Build final model ----
+
+
+set.seed(800)
+finalmodel_multigroup<-RandomForestWithStats(train = dataSplit_forValidation[[1]]$train[,colnames(dataSplit_forValidation[[1]]$train)%in%final_varsSelected_multigroup],
+                                             test =dataSplit_forValidation[[1]]$test[,colnames(dataSplit_forValidation[[1]]$test)%in%final_varsSelected_multigroup],
+                                             factor_train = dataSplit_forValidation[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_multigroup$Predictions,dataSplit_forValidation[[1]]$factor_test)
+#as expected the multigroup is not a good model
+
+
+# multigroup including also HCG and Progesterone
+finalmodel_multigroupPlusHCGPROG<-RandomForestWithStats(train = dataSplit_forValidation[[1]]$train[,colnames(dataSplit_forValidation[[1]]$train)%in%c(final_varsSelected_multigroup,"HCG","Progesterone")],
+                                             test =dataSplit_forValidation[[1]]$test[,colnames(dataSplit_forValidation[[1]]$test)%in%c(final_varsSelected_multigroup,"HCG","Progesterone")],
+                                             factor_train = dataSplit_forValidation[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_multigroupPlusHCGPROG$Predictions,dataSplit_forValidation[[1]]$factor_test)
+
+# multigroup including also HCG and Progesterone and metadata
+finalmodel_multigroupPlusHCGPROGandMetadata<-RandomForestWithStats(train = cbind(dataSplit_forValidation[[1]]$train[,colnames(dataSplit_forValidation[[1]]$train)%in%c(final_varsSelected_multigroup,"HCG","Progesterone")],data_for_limma[dataSplit_forValidation[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             test =cbind(dataSplit_forValidation[[1]]$test[,colnames(dataSplit_forValidation[[1]]$test)%in%c(final_varsSelected_multigroup,"HCG","Progesterone")],data_for_limma[-dataSplit_forValidation[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             factor_train = dataSplit_forValidation[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_multigroupPlusHCGPROGandMetadata$Predictions,dataSplit_forValidation[[1]]$factor_test)
+
+
+# multigroup no metabolites, only  HCG and Progesterone and metadata
+finalmodel_multigroupONLY_HCGPROGandMetadata<-RandomForestWithStats(train = cbind(dataSplit_forValidation[[1]]$train[,colnames(dataSplit_forValidation[[1]]$train)%in%c("HCG","Progesterone")],data_for_limma[dataSplit_forValidation[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             test =cbind(dataSplit_forValidation[[1]]$test[,colnames(dataSplit_forValidation[[1]]$test)%in%c("HCG","Progesterone")],data_for_limma[-dataSplit_forValidation[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             factor_train = dataSplit_forValidation[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_multigroupONLY_HCGPROGandMetadata$Predictions,dataSplit_forValidation[[1]]$factor_test)
+
+
+
+#two groups (LNSP vs Other)
+#first model using only selected metabolites
+set.seed(800)
+finalmodel_2groups<-RandomForestWithStats(train = dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%final_varsSelected_2groups],
+                                             test =dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%final_varsSelected_2groups],
+                                             factor_train = dataSplit_forValidation_2group[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation_2group[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_2groups$Predictions,dataSplit_forValidation_2group[[1]]$factor_test,positive = "Other")
+
+#for both groups including HCG and progesterone
+
+set.seed(800)
+finalmodel_2groupsPlusHCGPROG<-RandomForestWithStats(train = dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c(final_varsSelected_2groups,"HCG","Progesterone")],
+                                             test =dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c(final_varsSelected_2groups,"HCG","Progesterone")],
+                                             factor_train = dataSplit_forValidation_2group[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation_2group[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_2groupsPlusHCGPROG$Predictions,dataSplit_forValidation_2group[[1]]$factor_test,positive = "Other")
+
+
+#Model for both groups with selected metabolites, progesterone, HCG, BMI, Age and Gestation
+set.seed(800)
+finalmodel_2groupsPlusHCGPROG_andMetadata<-RandomForestWithStats(train =cbind( dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c(final_varsSelected_2groups,"HCG","Progesterone")],data_for_limma[dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             test =cbind(dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c(final_varsSelected_2groups,"HCG","Progesterone")],data_for_limma[-dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             factor_train = dataSplit_forValidation_2group[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation_2group[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_2groupsPlusHCGPROG_andMetadata$Predictions,dataSplit_forValidation_2group[[1]]$factor_test,positive = "Other")
+
+#Model for both groups with progesterone, HCG, BMI, Age and Gestation (no metabolites)
+set.seed(800)
+finalmodel_2groups_HCGProgMetadata<-RandomForestWithStats(train =cbind( dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c("HCG","Progesterone")],data_for_limma[dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             test =cbind(dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c("HCG","Progesterone")],data_for_limma[-dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                                             factor_train = dataSplit_forValidation_2group[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation_2group[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_2groups_HCGProgMetadata$Predictions,dataSplit_forValidation_2group[[1]]$factor_test,positive = "Other")
+
+
+
+#Model for both groups with progesterone and HCG only
+set.seed(800)
+finalmodel_2groups_HCGProgMetadata<-RandomForestWithStats(train = dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c("HCG","Progesterone")],
+                                             test =dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c("HCG","Progesterone")],
+                                             factor_train = dataSplit_forValidation_2group[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation_2group[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_2groups_HCGProgMetadata$Predictions,dataSplit_forValidation_2group[[1]]$factor_test,positive = "Other")
+
+#Model for both groups with  BMI, Age and Gestation only - results are very poor, with routine metadata not able to predict
+set.seed(800)
+finalmodel_2groups_HCGProgMetadata<-RandomForestWithStats(train =data_for_limma[dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")],
+                                             test =data_for_limma[-dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")],
+                                             factor_train = dataSplit_forValidation_2group[[1]]$factor_train,
+                                             factor_test = dataSplit_forValidation_2group[[1]]$factor_test,ntree = 500)
+
+confusionMatrix(finalmodel_2groups_HCGProgMetadata$Predictions,dataSplit_forValidation_2group[[1]]$factor_test,positive = "Other")
+
+
+
+```
+
+#### Fitting a glm model with the same data split
+
+We further compare prediction outputs with three models using a generalised linear model. In the first model we use selected metabolites, HCG +Progesterone and clinical variables (BMI, Gestation, Age). In the second model we use selected metabolites, HCG and Progesterone. In the third model we use HCG, Progesterone, BMI, Gestation and Age. All models predict really well, with equivalent AUROCs. 
+
+```{r}
+labels_ts = dataSplit_forValidation_2group[[1]]$factor_test
+
+labels_tr = ifelse(dataSplit_forValidation_2group[[1]]$factor_train=='LNSP', 0, 1)
+labels_ts = ifelse(dataSplit_forValidation_2group[[1]]$factor_test=='LNSP', 0, 1)
+
+
+LR_everything = fit_LR(data_tr=cbind(dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c(final_varsSelected_2groups,"HCG","Progesterone")],data_for_limma[dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                   data_ts =cbind(dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c(final_varsSelected_2groups,"HCG","Progesterone")],data_for_limma[-dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                   labels_tr = labels_tr)
+
+LR_metabs_HCGProg = fit_LR(data_tr= as.data.frame(dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c(final_varsSelected_2groups,"HCG","Progesterone")]),
+                data_ts =as.data.frame(dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c(final_varsSelected_2groups,"HCG","Progesterone")]),
+                labels_tr = labels_tr)
+
+LR_noMetabs = fit_LR(data_tr=cbind( dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c("HCG","Progesterone")],data_for_limma[dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                       data_ts =cbind(dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c("HCG","Progesterone")],data_for_limma[-dataSplit_forValidation_2group[[1]]$idx,c("BMI","Age","Gestation")]),
+                       labels_tr = labels_tr)
+
+
+
+LR_HCGProgOnly = fit_LR(data_tr= as.data.frame(dataSplit_forValidation_2group[[1]]$train[,colnames(dataSplit_forValidation_2group[[1]]$train)%in%c("HCG","Progesterone")]),
+                data_ts =as.data.frame(dataSplit_forValidation_2group[[1]]$test[,colnames(dataSplit_forValidation_2group[[1]]$test)%in%c("HCG","Progesterone")]),
+                labels_tr = labels_tr)
+
+
+roc.plot(labels_ts, cbind(LR_everything,LR_metabs_HCGProg,LR_noMetabs,LR_HCGProgOnly), 
+         legend = TRUE, 
+         leg.text = c('All',"Metabs_HCG_Prog", 'NoMetabs',"OnlyHCG&Prog"), 
+         plot.thres = NULL,cex=5,xlab="1-Specificity",ylab="Sensitivity")
+
+```
+
+
+
+
+# Conclusions
+
+Metabolite signals are not enough to predict the four different types of outcome. When the model includes also HCG and Progesterone predictions improve and become slightly better than random, showing some promise.
+
+Alternatively, a model to classify LNSP from Other adverse outcome performs very well. Using only the metabolite signals we are able to build a significant model that improves quite dramatically if HCG and Progesterone are included. In fact only HCG and Progesterone are good predictors on their own. If we also include BMI, Age and Gestation time then model performance improves slightly although these are not good predictors on their own. 
+
+Metabolites improve performance just so slightly. This could be due to the caveat is that the signals observed in the NMR data have a very small effect size. 
+
+
+
+
+
+
